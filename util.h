@@ -30,4 +30,6 @@
 
 #define offsetof(a,b) __builtin_offsetof(a,b)
 
+#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+
 #endif

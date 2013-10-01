@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -39,21 +40,31 @@ struct connection {
 
 void pferror(const int errsv, const char* format, ...);
 
+bool done = false;
+
+void server_finish(int signum)
+{
+	done = true;
+}
+
 
 int handle_one_command(int lirc, int client)
 {
 	static char cmdbuf[4096];
-	char *head = cmdbuf, *tail = cmdbuf, *end = cmdbuf +
+	char *data = cmdbuf + 16, *tail = data, *end = cmdbuf +
 		sizeof(cmdbuf), *next;
 	static char replybuf[4096];
 	char *rhead, *rtail, *rend = replybuf + sizeof(replybuf);
 	int result = 0, retval;
 
 	while (true) {
+		char *cmd, *nextcmd;
+		const char token[] = "SEND_ONCE ";
+
 		/*
 		 * cmdbuf
-		 * head: command start
-		 * next: command end
+		 * data: command start
+		 * next: next command start
 		 * tail: recv buf end
 		 * end: buffer end
 		 */
@@ -65,12 +76,11 @@ int handle_one_command(int lirc, int client)
 			}
 
 			retval = recv(client, tail, end - tail, 0);
-			if (retval == -1)
-			{
+			if (retval == -1) {
 				pferror(errno, "line %d", __LINE__);
 				abort();
 			} else if (retval == 0) {
-				if (tail != head) {
+				if (tail != data) {
 					fprintf(stderr, "Warning: incomplete client request\n");
 					return 0;
 				} else {
@@ -79,22 +89,50 @@ int handle_one_command(int lirc, int client)
 			} else {
 				tail += retval;
 			}
-		} while ((next = memchr(head, '\n', tail - head)) == NULL);
+		} while ((next = memchr(data, '\n', tail - data)) == NULL);
 		next++;
 		result++;
 
+		/* parse the command */
+		cmd = data;
+		nextcmd = next;
+		if (strncasecmp(data, token, min(strlen(token), (unsigned long) (next - data))) == 0)
+		{
+			int i;
+			char *tokens[4];
+
+			tokens[0] = data;
+			for (i = 1; tokens[i - 1] && i < ARRAY_SIZE(tokens); i++) {
+				tokens[i] = memchr(tokens[i - 1], ' ', next - tokens[i - 1]) + 1;
+			}
+
+			/* craft a new command */
+			if (i == ARRAY_SIZE(tokens)) {
+				retval = snprintf(replybuf, sizeof(replybuf),
+					 "simulate 00000000deadbeef 00 %.*s %.*s\n",
+					 (int) (tokens[3] - tokens[2] - 1), tokens[2],
+					 (int) (tokens[2] - tokens[1] - 1), tokens[1]);
+				if (retval < 0 || retval > sizeof(replybuf)) {
+					fprintf(stderr, "Warning: doctored request too long\n");
+					return 0;
+				}
+				cmd = replybuf;
+				nextcmd = replybuf + retval;
+			}
+		}
+
 		/* send it to lirc */
 		do {
-			retval = send(lirc, head, next - head, 0);
-			if (retval == -1)
-			{
+			retval = send(lirc, cmd, nextcmd - cmd, 0);
+			if (retval == -1) {
 				pferror(errno, "line %d", __LINE__);
 				abort();
 			} else {
-				head += retval;
+				cmd += retval;
 			}
 
-		} while (head < next);
+		} while (cmd < nextcmd);
+		data = next;
 
 		/* read lirc's reply (until a line that says "END") */
 		/*
@@ -114,8 +152,7 @@ int handle_one_command(int lirc, int client)
 			}
 
 			retval = recv(lirc, rtail, rend - rtail, 0);
-			if (retval == -1)
-			{
+			if (retval == -1) {
 				pferror(errno, "line %d", __LINE__);
 				abort();
 			} else if (retval == 0) {
@@ -142,8 +179,7 @@ int handle_one_command(int lirc, int client)
 		/* send it to the client */
 		do {
 			retval = send(client, rhead, rtail - rhead, 0);
-			if (retval == -1)
-			{
+			if (retval == -1) {
 				pferror(errno, "line %d", __LINE__);
 				abort();
 			} else {
@@ -166,13 +202,20 @@ int main(int argc, char *argv[])
 		},
 	};
 	LIST_HEAD(conn_head);
+	struct sigaction act = {
+		.sa_flags = 0,
+		.sa_handler = &server_finish,
+	};
 	int retval;
+
+	sigemptyset(&act.sa_mask);
+	sigaction(SIGINT, &act, NULL);
+	sigaction(SIGTERM, &act, NULL);
 
 	lirc = socket(AF_INET, SOCK_STREAM, 0);
 	printf("Connecting to local lirc... ");
 	retval = connect(lirc, (struct sockaddr *) &addr, sizeof(addr));
-	if (retval == -1)
-	{
+	if (retval == -1) {
 		pferror(errno, "line %d", __LINE__);
 		abort();
 	}
@@ -182,26 +225,23 @@ int main(int argc, char *argv[])
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
 	proxy = socket(AF_INET, SOCK_STREAM, 0);
 	retval = bind(proxy, (struct sockaddr *) &addr, sizeof(addr));
-	if (retval == -1)
-	{
+	if (retval == -1) {
 		pferror(errno, "line %d", __LINE__);
 		abort();
 	}
 	retval = listen(proxy, 1);
-	if (retval == -1)
-	{
+	if (retval == -1) {
 		pferror(errno, "line %d", __LINE__);
 		abort();
 	}
 	retval = fcntl(proxy, F_SETFL, O_NONBLOCK);
-	if (retval == -1)
-	{
+	if (retval == -1) {
 		pferror(errno, "line %d", __LINE__);
 		abort();
 	}
 	printf("Listenning on proxy port\n");
 
-	while (true) {
+	while (!done) {
 		fd_set set;
 		int nfds;
 		struct connection *conn, *next;
@@ -216,8 +256,10 @@ int main(int argc, char *argv[])
 		}
 
 		retval = select(nfds + 1, &set, NULL, NULL, NULL);
-		if (retval == -1)
-		{
+		if (retval == -1) {
+			if (errno == EINTR) {
+				continue;
+			}
 			pferror(errno, "line %d", __LINE__);
 			abort();
 		} else if (retval == 0) {
@@ -226,8 +268,10 @@ int main(int argc, char *argv[])
 
 		if (FD_ISSET(proxy, &set)) {
 			retval = accept(proxy, NULL, NULL);
-			if (retval == -1)
-			{
+			if (retval == -1) {
+				if (errno == EINTR) {
+					continue;
+				}
 				pferror(errno, "line %d", __LINE__);
 				abort();
 			}
@@ -248,6 +292,17 @@ int main(int argc, char *argv[])
 				}
 			}
 		}
+	}
+
+	retval = close(proxy);
+	if (retval == -1) {
+		pferror(errno, "line %d", __LINE__);
+		abort();
+	}
+	retval = close(lirc);
+	if (retval == -1) {
+		pferror(errno, "line %d", __LINE__);
+		abort();
 	}
 
 	return EXIT_SUCCESS;
@@ -272,42 +327,35 @@ void pferror(const int errsv, const char* format, ...)
 	char *p, *np;
 	va_list ap;
 
-	if ((p= malloc(size)) == NULL)
-	{
+	if ((p= malloc(size)) == NULL) {
 		return;
 	}
 
-	while (true)
-	{
+	while (true) {
 		/* Try to print in the allocated space. */
 		va_start(ap, format);
 		n= vsnprintf(p, size, format, ap);
 		va_end(ap);
 		/* If that worked, output the string. */
-		if (n > -1 && n < size)
-		{
+		if (n > -1 && n < size) {
 			fputs(p, stderr);
 			fprintf(stderr, ": %s\n", strerror(errsv));
 			return;
 		}
 
 		/* Else try again with more space. */
-		if (n > -1)    /* glibc 2.1 */
-		{
+		if (n > -1)    /* glibc 2.1 */ {
 			size= n + 1; /* precisely what is needed */
 		}
-		else           /* glibc 2.0 */
-		{
+		else           /* glibc 2.0 */ {
 			size*= 2;  /* twice the old size */
 		}
 
-		if ((np= realloc(p, size)) == NULL)
-		{
+		if ((np= realloc(p, size)) == NULL) {
 			free(p);
 			return;
 		}
-		else
-		{
+		else {
 			p= np;
 		}
 	}
